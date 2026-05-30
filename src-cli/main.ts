@@ -11,6 +11,7 @@ import { FacetCreator } from "../src/facetCreator";
 import { FacetLabelPlacer } from "../src/facetLabelPlacer";
 import { FacetResult } from "../src/facetmanagement";
 import { FacetReducer } from "../src/facetReducer";
+import { WasmReducer } from "../src/wasmReducer";
 import { Settings } from "../src/settings";
 import { Point } from "../src/structs/point";
 const svg2img = require("svg2img");
@@ -248,7 +249,7 @@ async function main() {
         console.log("Reducing facets");
         {
             const decileLog = makeDecileLogger("reduce");
-            await FacetReducer.reduceFacets(settings.removeFacetsSmallerThanNrOfPoints, settings.removeFacetsFromLargeToSmall, settings.maximumNumberOfFacets, colormapResult.colorsByIndex, facetResult, colormapResult.imgColorIndices, decileLog);
+            await WasmReducer.reduceFacets(settings.removeFacetsSmallerThanNrOfPoints, settings.removeFacetsFromLargeToSmall, settings.maximumNumberOfFacets, colormapResult.colorsByIndex, facetResult, colormapResult.imgColorIndices, decileLog);
         }
     } else {
         // ── narrow pixel cleanup loop ───────────────────────────────────────
@@ -282,7 +283,7 @@ async function main() {
             console.log("Reducing facets");
             {
                 const decileLog = makeDecileLogger(`reduce_run${run + 1}`);
-                await FacetReducer.reduceFacets(settings.removeFacetsSmallerThanNrOfPoints, settings.removeFacetsFromLargeToSmall, settings.maximumNumberOfFacets, colormapResult.colorsByIndex, facetResult, colormapResult.imgColorIndices, decileLog);
+                await WasmReducer.reduceFacets(settings.removeFacetsSmallerThanNrOfPoints, settings.removeFacetsFromLargeToSmall, settings.maximumNumberOfFacets, colormapResult.colorsByIndex, facetResult, colormapResult.imgColorIndices, decileLog);
             }
 
             // the colormapResult.imgColorIndices get updated as the facets are reduced, so just do a few runs of pixel cleanup
