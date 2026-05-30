@@ -85,7 +85,9 @@ export class WasmReducer {
         //   [size*5..size*5+cdSize) colorDistances (f64, 8 bytes each)
         const imgOffset = 0;
         const facetMapOffset = size;                              // u32 aligned after u8 block
-        const colorDistOffset = facetMapOffset + size * 4;        // f64 after u32 block
+        const colorDistOffsetRaw = facetMapOffset + size * 4;
+        const colorDistOffset = Math.ceil(colorDistOffsetRaw / 8) * 8; // align to 8 bytes for Float64Array
+        
         const totalBytes = colorDistOffset + nColors * nColors * 8;
 
         // Grow WASM memory if needed
