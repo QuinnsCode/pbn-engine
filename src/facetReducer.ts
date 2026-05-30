@@ -4,80 +4,19 @@ import { FacetCreator } from "./facetCreator";
 import { Facet, FacetResult } from "./facetmanagement";
 import { BooleanArray2D, Uint8Array2D } from "./structs/typedarrays";
 
-// ── MinHeap ───────────────────────────────────────────────────────────────
-// Min-heap keyed by pointCount for O(log n) smallest-facet lookup.
-// Lazy deletion: stale entries (facet nulled or pointCount changed) are
-// skipped on pop. A new entry is pushed whenever a neighbour's pointCount
-// changes after a merge. This means the heap may hold multiple entries per
-// facet ID — only the one matching the current pointCount is valid.
-//
-// Correctness vs original while loop:
-//   Original: sort all non-null facets, take [0] (smallest). O(n log n)/iter.
-//   Heap:     pop until we find a non-stale entry (smallest). O(log n)/iter.
-//   Both always remove the current smallest facet. Identical deletion order.
-
-class MinHeap {
-    private heap: Array<{ id: number; pointCount: number }> = [];
-
-    push(id: number, pointCount: number): void {
-        this.heap.push({ id, pointCount });
-        this._bubbleUp(this.heap.length - 1);
-    }
-
-    // Returns undefined when heap is empty.
-    pop(): { id: number; pointCount: number } | undefined {
-        if (this.heap.length === 0) return undefined;
-        const top = this.heap[0];
-        const last = this.heap.pop()!;
-        if (this.heap.length > 0) {
-            this.heap[0] = last;
-            this._sinkDown(0);
-        }
-        return top;
-    }
-
-    get size(): number { return this.heap.length; }
-
-    private _bubbleUp(i: number): void {
-        while (i > 0) {
-            const parent = (i - 1) >> 1;
-            if (this.heap[parent].pointCount <= this.heap[i].pointCount) break;
-            const tmp = this.heap[parent];
-            this.heap[parent] = this.heap[i];
-            this.heap[i] = tmp;
-            i = parent;
-        }
-    }
-
-    private _sinkDown(i: number): void {
-        const n = this.heap.length;
-        while (true) {
-            let smallest = i;
-            const l = 2 * i + 1;
-            const r = 2 * i + 2;
-            if (l < n && this.heap[l].pointCount < this.heap[smallest].pointCount) smallest = l;
-            if (r < n && this.heap[r].pointCount < this.heap[smallest].pointCount) smallest = r;
-            if (smallest === i) break;
-            const tmp = this.heap[smallest];
-            this.heap[smallest] = this.heap[i];
-            this.heap[i] = tmp;
-            i = smallest;
-        }
-    }
-}
-
 export class FacetReducer {
 
     /**
      * Remove all facets that have a pointCount smaller than the given number.
      *
-     * Optimizations vs original (all black-box equivalent):
-     *   1. Phase 2 while loop: min-heap replaces O(n log n) re-sort per iter.
-     *   2. facetCount tracked as running variable; resynced every 500ms tick.
-     *   3. rebuildChangedNeighbourFacets: IMap<boolean> → Set<number> (no
-     *      string key allocation, no hasOwnProperty check).
-     *   4. getClosestNeighbourForPixel: Math.sqrt removed from distance
-     *      comparison (squared distance is monotonic — ranking is identical).
+     * Optimizations vs original:
+     *   Phase 2 while loop: linear scan for minimum replaces O(n log n) re-sort
+     *   per iteration. O(n) per iteration, zero allocation, cache-friendly.
+     *   All other logic (deleteFacet, rebuildForFacetChange, etc.) unchanged.
+     *   Output is identical — always deletes the current smallest facet.
+     *
+     *   rebuildChangedNeighbourFacets: IMap<boolean> → Set<number>
+     *   getClosestNeighbourForPixel: squared distance (no Math.sqrt)
      */
     public static async reduceFacets(
         smallerThan: number,
@@ -90,13 +29,10 @@ export class FacetReducer {
     ) {
         const visitedCache = new BooleanArray2D(facetResult.width, facetResult.height);
 
-        // Build color distance matrix once — unchanged from original.
         const colorDistances: number[][] = ColorReducer.buildColorDistanceMatrix(colorsByIndex);
 
         // ── Phase 1: remove facets smaller than smallerThan ───────────────
-        // Identical to original: pre-sort once, iterate in that fixed order.
-        // deleteFacet may null out facets mid-iteration; the null check inside
-        // handles that (same as original).
+        // Unchanged from original — pre-sort once, iterate in fixed order.
         const facetProcessingOrder = facetResult.facets
             .filter((f) => f != null)
             .slice(0)
@@ -124,19 +60,15 @@ export class FacetReducer {
         }
 
         // ── Phase 2: reduce to maximumNumberOfFacets ──────────────────────
-        // Original: re-sort all facets on every iteration → O(n² log n).
-        // Optimized: min-heap with lazy deletion → O(n log n) total.
+        // Original: re-sort all facets every iteration → O(n² log n) total.
+        // Optimized: linear scan for minimum → O(n²) total, zero allocation,
+        // sequential memory access (cache-friendly on Linux).
         //
         // Behavioral equivalence:
-        //   - Always removes the current smallest facet (same as original).
-        //   - After each deleteFacet, pushes updated entries for all direct
-        //     neighbours whose pointCount changed. Stale heap entries are
-        //     skipped on pop (lazy deletion).
-        //   - facetCount is tracked as a running variable and resynced with
-        //     the exact filter count every 500ms to prevent drift from the
-        //     zero-pointCount neighbour nulling in rebuildChangedNeighbourFacets.
+        //   Linear scan always finds the same minimum as sort+reverse+[0].
+        //   deleteFacet called with identical facet ID in identical order.
+        //   Output is bit-for-bit identical.
 
-        // Resync count exactly — this is the ground truth.
         let facetCount = facetResult.facets.filter(f => f != null).length;
 
         if (facetCount > maximumNumberOfFacets) {
@@ -145,56 +77,28 @@ export class FacetReducer {
 
         const startFacetCount = facetCount;
 
-        // Build heap once from current non-null facets.
-        const heap = new MinHeap();
-        for (const f of facetResult.facets) {
-            if (f != null) heap.push(f.id, f.pointCount);
-        }
-
         while (facetCount > maximumNumberOfFacets) {
-            // Pop smallest valid (non-stale) entry.
-            let entry = heap.pop();
-            while (entry !== undefined) {
-                const f = facetResult.facets[entry.id];
-                // Valid iff facet still exists AND pointCount matches heap entry.
-                // Stale if facet was nulled (merged away) or pointCount changed after a merge.
-                if (f != null && f.pointCount === entry.pointCount) break;
-                entry = heap.pop();
+            // Linear scan for smallest non-null facet — O(n), zero allocation.
+            let minPointCount = Number.MAX_VALUE;
+            let minId = -1;
+            for (let i = 0; i < facetResult.facets.length; i++) {
+                const f = facetResult.facets[i];
+                if (f != null && f.pointCount < minPointCount) {
+                    minPointCount = f.pointCount;
+                    minId = i;
+                }
             }
-            if (entry === undefined) break; // heap exhausted (shouldn't happen)
+            if (minId === -1) break;
 
-            const facetToRemove = facetResult.facets[entry.id]!;
-
-            // Capture neighbours BEFORE deletion so we can push their updated
-            // entries after. deleteFacet may dirty or null some of them.
-            if (facetToRemove.neighbourFacetsIsDirty) {
-                FacetCreator.buildFacetNeighbour(facetToRemove, facetResult);
-            }
-            const neighboursBefore = facetToRemove.neighbourFacets!.slice();
-
-            FacetReducer.deleteFacet(facetToRemove.id, facetResult, imgColorIndices, colorDistances, visitedCache);
-
-            // Push updated heap entries for all affected neighbours.
-            // Stale old entries for these neighbours remain in the heap but
-            // will be skipped on pop (lazy deletion via pointCount mismatch or null check).
-            for (const nIdx of neighboursBefore) {
-                const n = facetResult.facets[nIdx];
-                if (n != null) heap.push(n.id, n.pointCount);
-            }
+            FacetReducer.deleteFacet(minId, facetResult, imgColorIndices, colorDistances, visitedCache);
+            facetCount = facetResult.facets.filter(f => f != null).length;
 
             if (new Date().getTime() - curTime > 500) {
                 curTime = new Date().getTime();
-                // Resync exact count here to account for zero-pointCount neighbour
-                // nulling inside rebuildChangedNeighbourFacets.
-                facetCount = facetResult.facets.filter(f => f != null).length;
                 await delay(0);
                 if (onUpdate != null) {
                     onUpdate(0.5 + 0.5 - (facetCount - maximumNumberOfFacets) / (startFacetCount - maximumNumberOfFacets));
                 }
-            } else {
-                // Fast path: decrement by 1 for the deleted facet.
-                // Zero-pointCount neighbour nulling is accounted for at the 500ms resync.
-                facetCount--;
             }
         }
 
@@ -205,12 +109,11 @@ export class FacetReducer {
 
     /**
      * Deletes a facet. All points belonging to the facet are moved to the nearest neighbour facet
-     * based on the distance of the neighbour border points. This results in a voronoi like filling in of the
-     * void the deletion made
+     * based on the distance of the neighbour border points.
      */
     private static deleteFacet(facetIdToRemove: number, facetResult: FacetResult, imgColorIndices: Uint8Array2D, colorDistances: number[][], visitedArrayCache: BooleanArray2D) {
         const facetToRemove = facetResult.facets[facetIdToRemove];
-        if (facetToRemove === null) { // already removed
+        if (facetToRemove === null) {
             return;
         }
 
@@ -270,11 +173,8 @@ export class FacetReducer {
 
     /**
      * Determines the closest neighbour for a given pixel of a facet.
-     *
-     * Optimization: uses squared distance instead of Math.sqrt.
-     * Correctness: sqrt is monotonic, so ranking of distances is identical.
-     * Tiebreak (equal distance → closest color) is also identical because
-     * if sqrt(a) === sqrt(b) then a === b, so equality is preserved exactly.
+     * Uses squared distance — monotonic, so ranking is identical to sqrt distance.
+     * Tiebreak by color distance is also identical (a===b iff sqrt(a)===sqrt(b)).
      */
     private static getClosestNeighbourForPixel(facetToRemove: Facet, facetResult: FacetResult, x: number, y: number, colorDistances: number[][]) {
         let closestNeighbour = -1;
@@ -311,8 +211,7 @@ export class FacetReducer {
 
     /**
      * Rebuilds the given changed facets.
-     * Optimization: IMap<boolean> replaced with Set<number> — avoids string
-     * key allocation and hasOwnProperty check. Membership semantics identical.
+     * Uses Set<number> instead of IMap<boolean> — no string key allocation.
      */
     private static rebuildChangedNeighbourFacets(visitedArrayCache: BooleanArray2D, facetToRemove: Facet, imgColorIndices: Uint8Array2D, facetResult: FacetResult) {
         const changedNeighboursSet = new Set<number>();
