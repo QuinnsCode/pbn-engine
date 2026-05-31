@@ -15,13 +15,9 @@ async function loadWasm(): Promise<void> {
     const wasmPath = path.join(__dirname, "facet_reduce.wasm");
     const wasmBytes = fs.readFileSync(wasmPath);
 
-    wasmMemory = new WebAssembly.Memory({ initial: 256, maximum: 65536 });
-
-    const result = await WebAssembly.instantiate(wasmBytes, {
-        env: { memory: wasmMemory },
-    });
-
+    const result = await WebAssembly.instantiate(wasmBytes, {});
     wasmInstance = result.instance;
+    wasmMemory = result.instance.exports.memory as WebAssembly.Memory;
 }
 
 export class WasmReducer {
