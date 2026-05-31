@@ -390,7 +390,6 @@ fn reduce_facets_internal(
     width: u32, height: u32, smaller_than: u32, maximum_facets: u32,
     remove_large_to_small: bool, color_distances: &[f64], n_colors: u32,
 ) {
-    unsafe { CHECKPOINT = 99; }
     unsafe { CHECKPOINT = 1; }
     let mut facets = get_facets(img, facet_map, width, height);
     unsafe { CHECKPOINT = 2; }
