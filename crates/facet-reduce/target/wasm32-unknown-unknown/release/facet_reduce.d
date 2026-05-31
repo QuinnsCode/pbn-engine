@@ -1,0 +1,1 @@
+/Users/ryanquinn/Documents/projects/pbn-engine/crates/facet-reduce/target/wasm32-unknown-unknown/release/facet_reduce.wasm: /Users/ryanquinn/Documents/projects/pbn-engine/crates/facet-reduce/src/lib.rs
