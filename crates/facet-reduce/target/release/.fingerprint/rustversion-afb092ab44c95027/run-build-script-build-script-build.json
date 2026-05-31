@@ -1,1 +1,0 @@
-{"rustc":17467972547956852243,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[14156967978702956262,"build_script_build",false,6665351933005979443]],"local":[{"RerunIfChanged":{"output":"release/build/rustversion-afb092ab44c95027/output","paths":["build/build.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}
