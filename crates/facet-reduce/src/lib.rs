@@ -274,6 +274,7 @@ fn rebuild_changed_neighbour_facets(
         };
 
         let new_facet = build_facet(n_idx, color, seed_x, seed_y, visited_cache, img, facet_map, width, height);
+        if n_idx as usize >= facets.len() { continue; }
         if new_facet.point_count == 0 { facets[n_idx as usize] = None; }
         else { facets[n_idx as usize] = Some(new_facet); }
     }
@@ -332,7 +333,10 @@ fn delete_facet(
         .and_then(|f| f.neighbour_facets.as_ref()).map(|n| !n.is_empty()).unwrap_or(false);
     if !has_neighbours { facets[facet_id as usize] = None; return; }
 
-    let bbox = facets[facet_id as usize].as_ref().unwrap().bbox.clone();
+    let bbox = match facets.get(facet_id as usize).and_then(|f| f.as_ref()) {
+        Some(f) => f.bbox.clone(),
+        None => return,
+    };
     for j in bbox.min_y..=bbox.max_y {
         for i in bbox.min_x..=bbox.max_x {
             let idx = (j * width as i32 + i) as usize;
