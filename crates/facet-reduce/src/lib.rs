@@ -1,5 +1,12 @@
 use std::collections::HashSet;
 
+static mut CHECKPOINT: u32 = 0;
+
+#[no_mangle]
+pub extern "C" fn get_checkpoint() -> u32 {
+    unsafe { CHECKPOINT }
+}
+
 #[derive(Clone)]
 struct BoundingBox {
     min_x: i32,
@@ -35,7 +42,6 @@ impl Facet {
     fn border_point_y(&self, i: usize) -> i32 { self.border_points[i * 2 + 1] }
 }
 
-// Safe facet_map read — checks x,y bounds AND array length
 #[inline]
 fn fm_get(facet_map: &[u32], x: i32, y: i32, w: i32, h: i32) -> Option<u32> {
     if x < 0 || y < 0 || x >= w || y >= h { return None; }
@@ -43,7 +49,6 @@ fn fm_get(facet_map: &[u32], x: i32, y: i32, w: i32, h: i32) -> Option<u32> {
     facet_map.get(idx).copied()
 }
 
-// Safe visited/img check — checks bounds then reads
 #[inline]
 fn is_blocked(vx: i32, vy: i32, w: i32, h: i32, visited: &[bool], img: &[u8], color: u8) -> bool {
     if vx < 0 || vy < 0 || vx >= w || vy >= h { return true; }
@@ -54,7 +59,6 @@ fn is_blocked(vx: i32, vy: i32, w: i32, h: i32, visited: &[bool], img: &[u8], co
     }
 }
 
-// Safe inner point check — uses get() for all accesses
 #[inline]
 fn match_all_around(img: &[u8], x: i32, y: i32, w: i32, h: i32, color: u8) -> bool {
     let idx = (y * w + x) as usize;
@@ -69,7 +73,6 @@ fn match_all_around(img: &[u8], x: i32, y: i32, w: i32, h: i32, color: u8) -> bo
     matches!(down, Some(&c) if c == color)
 }
 
-// Safe pixel visit — checks bounds before every write
 #[inline]
 fn visit_pixel(
     x: i32, y: i32, w: i32, h: i32,
@@ -92,7 +95,6 @@ fn visit_pixel(
     if y > facet.bbox.max_y { facet.bbox.max_y = y; }
 }
 
-// Iterative flood fill — no recursion, no stack overflow
 fn flood_fill(
     start_x: i32, start_y: i32,
     w: i32, h: i32,
@@ -103,7 +105,6 @@ fn flood_fill(
     let mut stack: Vec<(i32, i32)> = vec![(start_x, start_y)];
 
     while let Some((sx, sy)) = stack.pop() {
-        // Move upper-left from seed
         let mut xx = sx; let mut yy = sy;
         loop {
             let ox = xx; let oy = yy;
@@ -176,7 +177,6 @@ fn build_facet(
     facet
 }
 
-// All facet_map accesses go through fm_get — no direct [] indexing
 fn build_facet_neighbour(facet: &mut Facet, facet_map: &[u32], width: u32, height: u32) {
     let mut unique: HashSet<u32> = HashSet::new();
     let fid = facet.id;
@@ -256,7 +256,6 @@ fn rebuild_changed_neighbour_facets(
             .and_then(|f| f.neighbour_facets.clone()).unwrap_or_default();
         for &nn_idx in &nn { changed_set.insert(nn_idx); }
 
-        // clear visited cache
         let bbox = match facets.get(n_idx as usize).and_then(|f| f.as_ref()) {
             Some(n) => n.bbox.clone(), None => continue,
         };
@@ -267,7 +266,6 @@ fn rebuild_changed_neighbour_facets(
             }
         }
 
-        // get seed — skip if no border points
         let (seed_x, seed_y, color) = match facets.get(n_idx as usize).and_then(|f| f.as_ref()) {
             Some(n) if n.border_point_count() > 0 => (n.border_point_x(0), n.border_point_y(0), n.color),
             _ => continue,
@@ -327,22 +325,30 @@ fn delete_facet(
     color_distances: &[f64], n_colors: u32,
     visited_cache: &mut Vec<bool>, width: u32, height: u32,
 ) {
+    unsafe { CHECKPOINT = 10; }
     if facets.get(facet_id as usize).and_then(|f| f.as_ref()).is_none() { return; }
+    unsafe { CHECKPOINT = 11; }
     ensure_neighbours_built(facet_id, facets, facet_map, width, height);
+    unsafe { CHECKPOINT = 12; }
     let has_neighbours = facets.get(facet_id as usize).and_then(|f| f.as_ref())
         .and_then(|f| f.neighbour_facets.as_ref()).map(|n| !n.is_empty()).unwrap_or(false);
     if !has_neighbours { facets[facet_id as usize] = None; return; }
+    unsafe { CHECKPOINT = 13; }
 
     let bbox = match facets.get(facet_id as usize).and_then(|f| f.as_ref()) {
         Some(f) => f.bbox.clone(),
         None => return,
     };
+    unsafe { CHECKPOINT = 14; }
+
     for j in bbox.min_y..=bbox.max_y {
         for i in bbox.min_x..=bbox.max_x {
             let idx = (j * width as i32 + i) as usize;
             if idx < facet_map.len() && facet_map[idx] == facet_id {
+                unsafe { CHECKPOINT = 15; }
                 let closest = get_closest_neighbour_for_pixel(
                     facet_id, facets, i, j, color_distances, n_colors, facet_map, width, height);
+                unsafe { CHECKPOINT = 16; }
                 if closest >= 0 {
                     if let Some(Some(ref n)) = facets.get(closest as usize) {
                         img[idx] = n.color;
@@ -351,7 +357,9 @@ fn delete_facet(
             }
         }
     }
+    unsafe { CHECKPOINT = 17; }
     rebuild_for_facet_change(facet_id, facets, img, facet_map, visited_cache, width, height);
+    unsafe { CHECKPOINT = 18; }
     facets[facet_id as usize] = None;
 }
 
@@ -382,7 +390,9 @@ fn reduce_facets_internal(
     width: u32, height: u32, smaller_than: u32, maximum_facets: u32,
     remove_large_to_small: bool, color_distances: &[f64], n_colors: u32,
 ) {
+    unsafe { CHECKPOINT = 1; }
     let mut facets = get_facets(img, facet_map, width, height);
+    unsafe { CHECKPOINT = 2; }
     let size = (width * height) as usize;
     let mut visited_cache = vec![false; size];
 
@@ -393,11 +403,13 @@ fn reduce_facets_internal(
         pb.cmp(&pa)
     });
     if !remove_large_to_small { processing_order.reverse(); }
+    unsafe { CHECKPOINT = 3; }
 
     for &fid in &processing_order {
         let should = facets.get(fid as usize).and_then(|f| f.as_ref()).map(|f| f.point_count < smaller_than).unwrap_or(false);
         if should { delete_facet(fid, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, width, height); }
     }
+    unsafe { CHECKPOINT = 4; }
 
     let mut facet_count = facets.iter().filter(|f| f.is_some()).count();
     while facet_count > maximum_facets as usize {
@@ -411,6 +423,7 @@ fn reduce_facets_internal(
         delete_facet(min_id, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, width, height);
         facet_count = facets.iter().filter(|f| f.is_some()).count();
     }
+    unsafe { CHECKPOINT = 5; }
 }
 
 #[no_mangle]
