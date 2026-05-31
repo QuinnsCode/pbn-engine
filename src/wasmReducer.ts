@@ -56,8 +56,9 @@ export class WasmReducer {
             }
         }
 
-        const imgOffset = 0;
-        const facetMapOffset = Math.ceil(size / 4) * 4;
+        const heapBase = (inst.exports.__heap_base as WebAssembly.Global).value as number;
+        const imgOffset = Math.ceil(heapBase / 8) * 8;
+        const facetMapOffset = Math.ceil((imgOffset + size) / 4) * 4;
         const colorDistOffsetRaw = facetMapOffset + size * 4;
         const colorDistOffset = Math.ceil(colorDistOffsetRaw / 8) * 8;
         const totalBytes = colorDistOffset + nColors * nColors * 8;
