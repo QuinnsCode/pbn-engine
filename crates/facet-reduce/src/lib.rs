@@ -43,18 +43,25 @@ impl Facet {
         }
     }
 
-    fn border_point_count(&self) -> usize {
-        self.border_points.len() / 2
-    }
-
+    fn border_point_count(&self) -> usize { self.border_points.len() / 2 }
     fn border_point_x(&self, i: usize) -> i32 { self.border_points[i * 2] }
     fn border_point_y(&self, i: usize) -> i32 { self.border_points[i * 2 + 1] }
+}
+
+// Safe facet_map access — returns 0 (invalid facet ID guard) if out of bounds
+#[inline]
+fn fm_get(facet_map: &[u32], x: i32, y: i32, width: i32, height: i32) -> Option<u32> {
+    if x < 0 || y < 0 || x >= width || y >= height { return None; }
+    let idx = (y * width + x) as usize;
+    if idx >= facet_map.len() { return None; }
+    Some(facet_map[idx])
 }
 
 #[inline]
 fn is_blocked(vx: i32, vy: i32, width: i32, height: i32, visited: &[bool], img: &[u8], color: u8) -> bool {
     if vx < 0 || vy < 0 || vx >= width || vy >= height { return true; }
     let idx = (vy * width + vx) as usize;
+    if idx >= visited.len() { return true; }
     visited[idx] || img[idx] != color
 }
 
@@ -68,9 +75,11 @@ fn match_all_around(img: &[u8], x: i32, y: i32, width: i32, height: i32, color: 
 }
 
 #[inline]
-fn visit_pixel(x: i32, y: i32, width: i32, height: i32,
+fn visit_pixel(
+    x: i32, y: i32, width: i32, height: i32,
     visited: &mut [bool], facet_map: &mut [u32], img: &[u8],
-    facet_index: u32, facet_color: u8, facet: &mut Facet) {
+    facet_index: u32, facet_color: u8, facet: &mut Facet,
+) {
     let idx = (y * width + x) as usize;
     visited[idx] = true;
     facet_map[idx] = facet_index;
@@ -85,9 +94,7 @@ fn visit_pixel(x: i32, y: i32, width: i32, height: i32,
     if y > facet.bbox.max_y { facet.bbox.max_y = y; }
 }
 
-// Iterative flood fill — replaces the recursive TS fill/fillCore.
-// Uses an explicit work stack of (x, y) seed points to avoid WASM stack overflow.
-// Produces identical visited pixels and border points as the TS recursive version.
+// Iterative flood fill using explicit work stack — no recursion, no WASM stack overflow
 fn flood_fill(
     start_x: i32, start_y: i32,
     width: i32, height: i32,
@@ -98,23 +105,20 @@ fn flood_fill(
     visited: &mut [bool],
     facet: &mut Facet,
 ) {
-    // Work stack: each entry is a seed point to start a fill_core scan from
     let mut stack: Vec<(i32, i32)> = Vec::new();
     stack.push((start_x, start_y));
 
     while let Some((sx, sy)) = stack.pop() {
-        // Move upper-left from seed (mirrors TS fill() pre-loop)
+        // Move upper-left from seed
         let mut xx = sx;
         let mut yy = sy;
         loop {
-            let ox = xx;
-            let oy = yy;
+            let ox = xx; let oy = yy;
             while yy > 0 && !is_blocked(xx, yy - 1, width, height, visited, img, facet_color) { yy -= 1; }
             while xx > 0 && !is_blocked(xx - 1, yy, width, height, visited, img, facet_color) { xx -= 1; }
             if xx == ox && yy == oy { break; }
         }
 
-        // fill_core: scan rows downward
         let mut x = xx;
         let mut y = yy;
         let mut last_row_length: i32 = 0;
@@ -124,7 +128,6 @@ fn flood_fill(
             let mut scan_x = x;
 
             if last_row_length != 0 && is_blocked(x, y, width, height, visited, img, facet_color) {
-                // Narrow the row start rightward
                 loop {
                     last_row_length -= 1;
                     if last_row_length == 0 { break; }
@@ -134,29 +137,24 @@ fn flood_fill(
                 if last_row_length == 0 { break; }
                 scan_x = x;
             } else {
-                // Extend row start leftward
                 while x > 0 && !is_blocked(x - 1, y, width, height, visited, img, facet_color) {
                     x -= 1;
                     visit_pixel(x, y, width, height, visited, facet_map, img, facet_index, facet_color, facet);
                     row_length += 1;
                     last_row_length += 1;
-                    // Push seed above for any unvisited cell to the upper-left
                     if y > 0 && !is_blocked(x, y - 1, width, height, visited, img, facet_color) {
                         stack.push((x, y - 1));
                     }
                 }
             }
 
-            // Scan rightward
             while scan_x < width && !is_blocked(scan_x, y, width, height, visited, img, facet_color) {
                 visit_pixel(scan_x, y, width, height, visited, facet_map, img, facet_index, facet_color, facet);
                 row_length += 1;
                 scan_x += 1;
             }
 
-            // Handle non-rectangular blocks
             if row_length < last_row_length {
-                // Cells to the right of this row that were in the previous row
                 let end = x + last_row_length;
                 let mut tsx = scan_x + 1;
                 while tsx < end {
@@ -166,7 +164,6 @@ fn flood_fill(
                     tsx += 1;
                 }
             } else if row_length > last_row_length && y > 0 {
-                // Cells above that extend beyond the previous row
                 let mut ux = x + last_row_length + 1;
                 while ux < scan_x {
                     if !is_blocked(ux, y - 1, width, height, visited, img, facet_color) {
@@ -195,29 +192,20 @@ fn build_facet(
     facet
 }
 
+// Every facet_map access goes through fm_get — guaranteed no out-of-bounds panic
 fn build_facet_neighbour(facet: &mut Facet, facet_map: &[u32], width: u32, height: u32) {
     let mut unique: HashSet<u32> = HashSet::new();
     let fid = facet.id;
+    let w = width as i32;
+    let h = height as i32;
     let bp_count = facet.border_point_count();
     for i in 0..bp_count {
         let px = facet.border_point_x(i);
         let py = facet.border_point_y(i);
-        if px > 0 {
-            let id = facet_map[(py * width as i32 + px - 1) as usize];
-            if id != fid { unique.insert(id); }
-        }
-        if py > 0 {
-            let id = facet_map[((py - 1) * width as i32 + px) as usize];
-            if id != fid { unique.insert(id); }
-        }
-        if px + 1 < width as i32 {
-            let id = facet_map[(py * width as i32 + px + 1) as usize];
-            if id != fid { unique.insert(id); }
-        }
-        if py + 1 < height as i32 {
-            let id = facet_map[((py + 1) * width as i32 + px) as usize];
-            if id != fid { unique.insert(id); }
-        }
+        if let Some(id) = fm_get(facet_map, px - 1, py, w, h) { if id != fid { unique.insert(id); } }
+        if let Some(id) = fm_get(facet_map, px, py - 1, w, h) { if id != fid { unique.insert(id); } }
+        if let Some(id) = fm_get(facet_map, px + 1, py, w, h) { if id != fid { unique.insert(id); } }
+        if let Some(id) = fm_get(facet_map, px, py + 1, w, h) { if id != fid { unique.insert(id); } }
     }
     facet.neighbour_facets = Some(unique.into_iter().collect());
     facet.neighbour_facets_is_dirty = false;
@@ -301,10 +289,8 @@ fn rebuild_changed_neighbour_facets(
 
     for &n_idx in &neighbours {
         if facets.get(n_idx as usize).and_then(|f| f.as_ref()).is_none() { continue; }
-
         changed_set.insert(n_idx);
 
-        // collect neighbours-of-neighbour
         ensure_neighbours_built(n_idx, facets, facet_map, width, height);
         let nn = facets.get(n_idx as usize)
             .and_then(|f| f.as_ref())
@@ -363,20 +349,23 @@ fn rebuild_for_facet_change(
         None => return,
     };
 
+    let w = width as i32;
+    let h = height as i32;
     let mut needs_rebuild = false;
+
     for cy in bbox.min_y..=bbox.max_y {
         for cx in bbox.min_x..=bbox.max_x {
-            let idx = (cy * width as i32 + cx) as usize;
+            let idx = (cy * w + cx) as usize;
             if idx >= facet_map.len() { continue; }
             if facet_map[idx] != facet_id { continue; }
             needs_rebuild = true;
 
-            let dirs: [(i32, i32); 4] = [(-1, 0), (0, -1), (1, 0), (0, 1)];
-            for (dx, dy) in dirs {
+            for (dx, dy) in [(-1i32, 0i32), (0, -1), (1, 0), (0, 1)] {
                 let nx = cx + dx;
                 let ny = cy + dy;
-                if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 { continue; }
-                let nidx = (ny * width as i32 + nx) as usize;
+                if nx < 0 || ny < 0 || nx >= w || ny >= h { continue; }
+                let nidx = (ny * w + nx) as usize;
+                if nidx >= facet_map.len() { continue; }
                 let nfid = facet_map[nidx];
                 if nfid == facet_id { continue; }
                 if let Some(Some(ref n)) = facets.get(nfid as usize) {
@@ -481,7 +470,6 @@ fn reduce_facets_internal(
     let size = (width * height) as usize;
     let mut visited_cache = vec![false; size];
 
-    // Phase 1
     let mut processing_order: Vec<u32> = facets.iter()
         .filter_map(|f| f.as_ref().map(|f| f.id))
         .collect();
@@ -501,7 +489,6 @@ fn reduce_facets_internal(
         }
     }
 
-    // Phase 2
     let mut facet_count = facets.iter().filter(|f| f.is_some()).count();
 
     while facet_count > maximum_facets as usize {
@@ -533,7 +520,6 @@ pub extern "C" fn reduce_facets(
     n_colors: u32,
 ) {
     let size = (width * height) as usize;
-
     let mut img: Vec<u8> = unsafe { std::slice::from_raw_parts(img_ptr, size).to_vec() };
     let mut fmap: Vec<u32> = unsafe { std::slice::from_raw_parts(facet_map_ptr, size).to_vec() };
     let color_distances: Vec<f64> = unsafe { std::slice::from_raw_parts(color_dist_ptr, (n_colors * n_colors) as usize).to_vec() };
