@@ -18,6 +18,12 @@ async function loadWasm(): Promise<void> {
     const result = await WebAssembly.instantiate(wasmBytes, {});
     wasmInstance = result.instance;
     wasmMemory = result.instance.exports.memory as WebAssembly.Memory;
+    // Pre-grow WASM memory to 64MB to avoid OOM during reduction
+    const targetPages = 1024; // 64MB
+    const currentPages = wasmMemory.buffer.byteLength / 65536;
+    if (currentPages < targetPages) {
+        wasmMemory.grow(targetPages - currentPages);
+    }
 }
 
 export class WasmReducer {
