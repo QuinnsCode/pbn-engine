@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::collections::VecDeque;
 
 static mut CHECKPOINT: u32 = 0;
 
@@ -174,67 +173,32 @@ fn ensure_neighbours(facet_id: usize, facets: &mut Vec<Facet>, facet_map: &[u32]
     facets[facet_id].neighbour_facets_is_dirty = false;
 }
 
-// ── Multi-source BFS distance transform ──────────────────────────────────────
-// For the deleted facet's bounding box + small margin, compute nearest alive
-// neighbour facet for every pixel using BFS from all neighbour border pixels.
-// O(pixels in region) — replaces O(pixels × border_points) inner loop.
-fn build_nearest_neighbour_map(
-    facet_id: u32,
-    facets: &[Facet],
-    facet_map: &[u32],
-    width: u32, height: u32,
-) -> Vec<u32> {
-    let size = (width * height) as usize;
-    // nearest[idx] = facet_id of nearest alive neighbour (u32::MAX = unvisited)
-    let mut nearest: Vec<u32> = vec![u32::MAX; size];
-    // Pack (x,y) as single u32 index for cache efficiency — halves queue memory
-    let mut queue: VecDeque<u32> = VecDeque::new();
-    let w = width as i32; let h = height as i32;
-
-    // Seed BFS from all border points of alive neighbours
-    let neighbours = &facets[facet_id as usize].neighbour_facets;
-    for &n_idx in neighbours {
+fn get_closest_neighbour_for_pixel(
+    facet: &Facet, facets: &[Facet],
+    x: i32, y: i32, color_distances: &[f64], n_colors: u32) -> i32 {
+    let mut closest = -1i32;
+    let mut min_dist_sq = i64::MAX;
+    let mut min_color_dist = f64::MAX;
+    for &n_idx in &facet.neighbour_facets {
         let n = &facets[n_idx as usize];
         if !n.alive { continue; }
         for &(bx, by) in &n.border_points {
-            let idx = (by * w + bx) as usize;
-            if idx < size && nearest[idx] == u32::MAX {
-                nearest[idx] = n_idx;
-                queue.push_back(idx as u32);
-            }
-        }
-    }
-
-    // Seed from pixels already assigned to alive neighbours in deleted facet bbox
-    let bbox = &facets[facet_id as usize].bbox;
-    for py in bbox.min_y..=bbox.max_y {
-        for px in bbox.min_x..=bbox.max_x {
-            let idx = (py * w + px) as usize;
-            if idx >= size { continue; }
-            let fid = facet_map[idx];
-            if fid != facet_id && (fid as usize) < facets.len() && facets[fid as usize].alive {
-                if nearest[idx] == u32::MAX {
-                    nearest[idx] = fid;
-                    queue.push_back(idx as u32);
+            let dx = (bx - x) as i64;
+            let dy = (by - y) as i64;
+            let dist_sq = dx*dx + dy*dy;
+            if dist_sq < min_dist_sq {
+                min_dist_sq = dist_sq;
+                closest = n_idx as i32;
+                min_color_dist = f64::MAX;
+            } else if dist_sq == min_dist_sq {
+                let cd_idx = (facet.color as u32 * n_colors + n.color as u32) as usize;
+                if let Some(&cd) = color_distances.get(cd_idx) {
+                    if cd < min_color_dist { min_color_dist = cd; closest = n_idx as i32; }
                 }
             }
         }
     }
-
-    // BFS outward — unpack index back to x,y for neighbour checks
-    while let Some(packed) = queue.pop_front() {
-        let idx = packed as usize;
-        let owner = nearest[idx];
-        let x = (idx as i32) % w;
-        let y = (idx as i32) / w;
-        // 4-connected neighbours
-        if x > 0     { let nidx = idx - 1;         if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
-        if y > 0     { let nidx = idx - w as usize; if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
-        if x+1 < w   { let nidx = idx + 1;         if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
-        if y+1 < h   { let nidx = idx + w as usize; if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
-    }
-
-    nearest
+    closest
 }
 
 fn rebuild_changed_neighbour_facets(
@@ -252,7 +216,6 @@ fn rebuild_changed_neighbour_facets(
     for &n_idx in &neighbours {
         if !facets[n_idx as usize].alive { continue; }
         changed_set.insert(n_idx);
-
         ensure_neighbours(n_idx as usize, facets, facet_map, width, height);
         let nn: Vec<u32> = facets[n_idx as usize].neighbour_facets.clone();
         for &nn_idx in &nn { changed_set.insert(nn_idx); }
@@ -356,47 +319,17 @@ fn delete_facet(
         return;
     }
 
-    // Build distance transform — O(pixels in bbox region) BFS
-    let nearest = build_nearest_neighbour_map(facet_id, facets, facet_map, width, height);
-
     let bbox = facets[facet_id as usize].bbox.clone();
     let w = width as i32;
 
-    // Reassign pixels using O(1) lookup from distance transform
     for j in bbox.min_y..=bbox.max_y {
         for i in bbox.min_x..=bbox.max_x {
             let idx = (j * w + i) as usize;
             if idx < facet_map.len() && facet_map[idx] == facet_id {
-                let closest = nearest[idx];
-                if closest != u32::MAX && (closest as usize) < facets.len() && facets[closest as usize].alive {
-                    // tiebreak by color distance if needed — use nearest as primary
-                    // For equal-distance pixels check color distance
-                    let facet_color = facets[facet_id as usize].color;
-                    let best = if n_colors > 0 {
-                        // Check all alive neighbours at same manhattan distance
-                        let mut best_id = closest;
-                        let mut best_color_dist = {
-                            let cd_idx = (facet_color as u32 * n_colors + facets[closest as usize].color as u32) as usize;
-                            color_distances.get(cd_idx).copied().unwrap_or(f64::MAX)
-                        };
-                        for &n_idx in &facets[facet_id as usize].neighbour_facets {
-                            if n_idx == closest { continue; }
-                            if n_idx as usize >= facets.len() || !facets[n_idx as usize].alive { continue; }
-                            if nearest[idx] == closest {
-                                let cd_idx = (facet_color as u32 * n_colors + facets[n_idx as usize].color as u32) as usize;
-                                if let Some(&cd) = color_distances.get(cd_idx) {
-                                    if cd < best_color_dist {
-                                        best_color_dist = cd;
-                                        best_id = n_idx;
-                                    }
-                                }
-                            }
-                        }
-                        best_id
-                    } else {
-                        closest
-                    };
-                    img[idx] = facets[best as usize].color;
+                let closest = get_closest_neighbour_for_pixel(
+                    &facets[facet_id as usize], facets, i, j, color_distances, n_colors);
+                if closest >= 0 && (closest as usize) < facets.len() && facets[closest as usize].alive {
+                    img[idx] = facets[closest as usize].color;
                 }
             }
         }
