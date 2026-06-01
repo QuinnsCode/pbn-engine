@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 static mut CHECKPOINT: u32 = 0;
 
@@ -151,13 +152,9 @@ fn build_facet(facet_index: u32, facet_color: u8, x: i32, y: i32,
     facet
 }
 
-// Takes border_points and facet_id directly — no facets borrow needed, no facet_map clone
 fn build_neighbours_from_border_points(
-    border_points: &[(i32, i32)],
-    fid: u32,
-    facet_map: &[u32],
-    width: u32, height: u32,
-) -> Vec<u32> {
+    border_points: &[(i32, i32)], fid: u32,
+    facet_map: &[u32], width: u32, height: u32) -> Vec<u32> {
     let mut unique: HashSet<u32> = HashSet::new();
     let w = width as i32; let h = height as i32;
     for &(px, py) in border_points {
@@ -169,7 +166,6 @@ fn build_neighbours_from_border_points(
     unique.into_iter().collect()
 }
 
-// Ensure neighbours built for a single facet — no facet_map clone
 fn ensure_neighbours(facet_id: usize, facets: &mut Vec<Facet>, facet_map: &[u32], width: u32, height: u32) {
     if !facets[facet_id].neighbour_facets_is_dirty { return; }
     let bps = facets[facet_id].border_points.clone();
@@ -178,32 +174,67 @@ fn ensure_neighbours(facet_id: usize, facets: &mut Vec<Facet>, facet_map: &[u32]
     facets[facet_id].neighbour_facets_is_dirty = false;
 }
 
-fn get_closest_neighbour_for_pixel(
-    facet: &Facet, facets: &[Facet],
-    x: i32, y: i32, color_distances: &[f64], n_colors: u32) -> i32 {
-    let mut closest = -1i32;
-    let mut min_dist_sq = i64::MAX;
-    let mut min_color_dist = f64::MAX;
-    for &n_idx in &facet.neighbour_facets {
+// ── Multi-source BFS distance transform ──────────────────────────────────────
+// For the deleted facet's bounding box + small margin, compute nearest alive
+// neighbour facet for every pixel using BFS from all neighbour border pixels.
+// O(pixels in region) — replaces O(pixels × border_points) inner loop.
+fn build_nearest_neighbour_map(
+    facet_id: u32,
+    facets: &[Facet],
+    facet_map: &[u32],
+    width: u32, height: u32,
+) -> Vec<u32> {
+    let size = (width * height) as usize;
+    // nearest[idx] = facet_id of nearest alive neighbour (u32::MAX = unvisited)
+    let mut nearest: Vec<u32> = vec![u32::MAX; size];
+    // Pack (x,y) as single u32 index for cache efficiency — halves queue memory
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    let w = width as i32; let h = height as i32;
+
+    // Seed BFS from all border points of alive neighbours
+    let neighbours = &facets[facet_id as usize].neighbour_facets;
+    for &n_idx in neighbours {
         let n = &facets[n_idx as usize];
         if !n.alive { continue; }
         for &(bx, by) in &n.border_points {
-            let dx = (bx - x) as i64;
-            let dy = (by - y) as i64;
-            let dist_sq = dx*dx + dy*dy;
-            if dist_sq < min_dist_sq {
-                min_dist_sq = dist_sq;
-                closest = n_idx as i32;
-                min_color_dist = f64::MAX;
-            } else if dist_sq == min_dist_sq {
-                let cd_idx = (facet.color as u32 * n_colors + n.color as u32) as usize;
-                if let Some(&cd) = color_distances.get(cd_idx) {
-                    if cd < min_color_dist { min_color_dist = cd; closest = n_idx as i32; }
+            let idx = (by * w + bx) as usize;
+            if idx < size && nearest[idx] == u32::MAX {
+                nearest[idx] = n_idx;
+                queue.push_back(idx as u32);
+            }
+        }
+    }
+
+    // Seed from pixels already assigned to alive neighbours in deleted facet bbox
+    let bbox = &facets[facet_id as usize].bbox;
+    for py in bbox.min_y..=bbox.max_y {
+        for px in bbox.min_x..=bbox.max_x {
+            let idx = (py * w + px) as usize;
+            if idx >= size { continue; }
+            let fid = facet_map[idx];
+            if fid != facet_id && (fid as usize) < facets.len() && facets[fid as usize].alive {
+                if nearest[idx] == u32::MAX {
+                    nearest[idx] = fid;
+                    queue.push_back(idx as u32);
                 }
             }
         }
     }
-    closest
+
+    // BFS outward — unpack index back to x,y for neighbour checks
+    while let Some(packed) = queue.pop_front() {
+        let idx = packed as usize;
+        let owner = nearest[idx];
+        let x = (idx as i32) % w;
+        let y = (idx as i32) / w;
+        // 4-connected neighbours
+        if x > 0     { let nidx = idx - 1;         if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
+        if y > 0     { let nidx = idx - w as usize; if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
+        if x+1 < w   { let nidx = idx + 1;         if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
+        if y+1 < h   { let nidx = idx + w as usize; if nidx < size && nearest[nidx] == u32::MAX { nearest[nidx] = owner; queue.push_back(nidx as u32); } }
+    }
+
+    nearest
 }
 
 fn rebuild_changed_neighbour_facets(
@@ -215,7 +246,6 @@ fn rebuild_changed_neighbour_facets(
     width: u32, height: u32,
 ) {
     ensure_neighbours(facet_id as usize, facets, facet_map, width, height);
-
     let neighbours: Vec<u32> = facets[facet_id as usize].neighbour_facets.clone();
     let mut changed_set: HashSet<u32> = HashSet::new();
 
@@ -227,7 +257,6 @@ fn rebuild_changed_neighbour_facets(
         let nn: Vec<u32> = facets[n_idx as usize].neighbour_facets.clone();
         for &nn_idx in &nn { changed_set.insert(nn_idx); }
 
-        // clear visited cache for this neighbour's pixels
         let bbox = facets[n_idx as usize].bbox.clone();
         let w = width as i32;
         for cy in bbox.min_y..=bbox.max_y {
@@ -252,7 +281,6 @@ fn rebuild_changed_neighbour_facets(
         }
     }
 
-    // second pass: clear visited cache again
     for &n_idx in &neighbours {
         if !facets[n_idx as usize].alive { continue; }
         let bbox = facets[n_idx as usize].bbox.clone();
@@ -284,11 +312,9 @@ fn rebuild_for_facet_change(
     width: u32, height: u32,
 ) {
     rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, width, height);
-
     let bbox = facets[facet_id as usize].bbox.clone();
     let w = width as i32; let h = height as i32;
     let mut needs_rebuild = false;
-
     for y in bbox.min_y..=bbox.max_y {
         for x in bbox.min_x..=bbox.max_x {
             let idx = (y * w + x) as usize;
@@ -309,7 +335,6 @@ fn rebuild_for_facet_change(
             }
         }
     }
-
     if needs_rebuild {
         rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, width, height);
     }
@@ -325,25 +350,53 @@ fn delete_facet(
     width: u32, height: u32,
 ) {
     if !facets[facet_id as usize].alive { return; }
-
     ensure_neighbours(facet_id as usize, facets, facet_map, width, height);
-
     if facets[facet_id as usize].neighbour_facets.is_empty() {
         facets[facet_id as usize].alive = false;
         return;
     }
 
+    // Build distance transform — O(pixels in bbox region) BFS
+    let nearest = build_nearest_neighbour_map(facet_id, facets, facet_map, width, height);
+
     let bbox = facets[facet_id as usize].bbox.clone();
     let w = width as i32;
 
+    // Reassign pixels using O(1) lookup from distance transform
     for j in bbox.min_y..=bbox.max_y {
         for i in bbox.min_x..=bbox.max_x {
             let idx = (j * w + i) as usize;
             if idx < facet_map.len() && facet_map[idx] == facet_id {
-                let closest = get_closest_neighbour_for_pixel(
-                    &facets[facet_id as usize], facets, i, j, color_distances, n_colors);
-                if closest >= 0 && (closest as usize) < facets.len() && facets[closest as usize].alive {
-                    img[idx] = facets[closest as usize].color;
+                let closest = nearest[idx];
+                if closest != u32::MAX && (closest as usize) < facets.len() && facets[closest as usize].alive {
+                    // tiebreak by color distance if needed — use nearest as primary
+                    // For equal-distance pixels check color distance
+                    let facet_color = facets[facet_id as usize].color;
+                    let best = if n_colors > 0 {
+                        // Check all alive neighbours at same manhattan distance
+                        let mut best_id = closest;
+                        let mut best_color_dist = {
+                            let cd_idx = (facet_color as u32 * n_colors + facets[closest as usize].color as u32) as usize;
+                            color_distances.get(cd_idx).copied().unwrap_or(f64::MAX)
+                        };
+                        for &n_idx in &facets[facet_id as usize].neighbour_facets {
+                            if n_idx == closest { continue; }
+                            if n_idx as usize >= facets.len() || !facets[n_idx as usize].alive { continue; }
+                            if nearest[idx] == closest {
+                                let cd_idx = (facet_color as u32 * n_colors + facets[n_idx as usize].color as u32) as usize;
+                                if let Some(&cd) = color_distances.get(cd_idx) {
+                                    if cd < best_color_dist {
+                                        best_color_dist = cd;
+                                        best_id = n_idx;
+                                    }
+                                }
+                            }
+                        }
+                        best_id
+                    } else {
+                        closest
+                    };
+                    img[idx] = facets[best as usize].color;
                 }
             }
         }
@@ -357,7 +410,6 @@ fn get_facets(img: &mut Vec<u8>, facet_map: &mut Vec<u32>, width: u32, height: u
     let size = (width * height) as usize;
     let mut visited = vec![false; size];
     let mut facets: Vec<Facet> = Vec::new();
-
     for j in 0..height as i32 {
         for i in 0..width as i32 {
             let idx = (j * width as i32 + i) as usize;
@@ -369,15 +421,12 @@ fn get_facets(img: &mut Vec<u8>, facet_map: &mut Vec<u32>, width: u32, height: u
             }
         }
     }
-
-    // build neighbours — no clone of facet_map needed
     for i in 0..facets.len() {
         let bps = facets[i].border_points.clone();
         let fid = facets[i].id;
         facets[i].neighbour_facets = build_neighbours_from_border_points(&bps, fid, facet_map, width, height);
         facets[i].neighbour_facets_is_dirty = false;
     }
-
     facets
 }
 
