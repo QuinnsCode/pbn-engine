@@ -1,6 +1,6 @@
 {
   "name": "paint-by-numbers-generator",
-  "version": "0.5.23",
+  "version": "0.5.24",
   "description": "Paint by numbers generator",
   "bin": "./src-cli/main.js",
   "scripts": {
