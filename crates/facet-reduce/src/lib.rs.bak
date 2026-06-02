@@ -13,13 +13,6 @@ struct BoundingBox {
 }
 impl BoundingBox {
     fn new() -> Self { BoundingBox { min_x: i32::MAX, min_y: i32::MAX, max_x: i32::MIN, max_y: i32::MIN } }
-    fn is_valid(&self) -> bool { self.min_x <= self.max_x && self.min_y <= self.max_y }
-    fn update(&mut self, x: i32, y: i32) {
-        if x < self.min_x { self.min_x = x; }
-        if x > self.max_x { self.max_x = x; }
-        if y < self.min_y { self.min_y = y; }
-        if y > self.max_y { self.max_y = y; }
-    }
 }
 
 struct Facet {
@@ -84,7 +77,10 @@ fn visit_pixel(x: i32, y: i32, w: i32, h: i32,
     if !match_all_around(img, x, y, w, h, facet_color) {
         facet.border_points.push((x, y));
     }
-    facet.bbox.update(x, y);
+    if x < facet.bbox.min_x { facet.bbox.min_x = x; }
+    if x > facet.bbox.max_x { facet.bbox.max_x = x; }
+    if y < facet.bbox.min_y { facet.bbox.min_y = y; }
+    if y > facet.bbox.max_y { facet.bbox.max_y = y; }
 }
 
 fn flood_fill(start_x: i32, start_y: i32, w: i32, h: i32,
@@ -205,75 +201,105 @@ fn get_closest_neighbour_for_pixel(
     closest
 }
 
-// Recompute border_points and bbox for a facet by scanning only the
-// affected region — union of deleted facet bbox and neighbour bbox.
-// O(region pixels) not O(full facet pixels via flood fill).
-fn recompute_facet_metadata_in_region(
+fn rebuild_changed_neighbour_facets(
+    visited_cache: &mut Vec<bool>,
     facet_id: u32,
     facets: &mut Vec<Facet>,
-    img: &[u8],
-    facet_map: &[u32],
-    region_min_x: i32, region_min_y: i32,
-    region_max_x: i32, region_max_y: i32,
+    img: &mut Vec<u8>,
+    facet_map: &mut Vec<u32>,
     width: u32, height: u32,
 ) {
-    let w = width as i32; let h = height as i32;
-    let color = facets[facet_id as usize].color;
+    ensure_neighbours(facet_id as usize, facets, facet_map, width, height);
+    let neighbours: Vec<u32> = facets[facet_id as usize].neighbour_facets.clone();
+    let mut changed_set: HashSet<u32> = HashSet::new();
 
-    // Expand region by 1 to catch border point changes at edges
-    let scan_min_x = (region_min_x - 1).max(0);
-    let scan_min_y = (region_min_y - 1).max(0);
-    let scan_max_x = (region_max_x + 1).min(w - 1);
-    let scan_max_y = (region_max_y + 1).min(h - 1);
+    for &n_idx in &neighbours {
+        if !facets[n_idx as usize].alive { continue; }
+        changed_set.insert(n_idx);
+        ensure_neighbours(n_idx as usize, facets, facet_map, width, height);
+        let nn: Vec<u32> = facets[n_idx as usize].neighbour_facets.clone();
+        for &nn_idx in &nn { changed_set.insert(nn_idx); }
 
-    let mut new_bbox = BoundingBox::new();
-    let mut new_border: Vec<(i32, i32)> = Vec::new();
-    let mut new_count = 0u32;
-
-    // Full scan for point_count and bbox — needed for correctness
-    // but we only do this for the full facet bbox, not the whole image
-    let full_bbox = facets[facet_id as usize].bbox.clone();
-    for py in full_bbox.min_y..=full_bbox.max_y {
-        for px in full_bbox.min_x..=full_bbox.max_x {
-            let idx = (py * w + px) as usize;
-            if idx < facet_map.len() && facet_map[idx] == facet_id {
-                new_count += 1;
-                new_bbox.update(px, py);
+        let bbox = facets[n_idx as usize].bbox.clone();
+        let w = width as i32;
+        for cy in bbox.min_y..=bbox.max_y {
+            for cx in bbox.min_x..=bbox.max_x {
+                let idx = (cy * w + cx) as usize;
+                if idx < facet_map.len() && facet_map[idx] == n_idx {
+                    visited_cache[idx] = false;
+                }
             }
+        }
+
+        if facets[n_idx as usize].border_points.is_empty() { continue; }
+        let (seed_x, seed_y) = facets[n_idx as usize].border_points[0];
+        let color = facets[n_idx as usize].color;
+
+        let new_facet = build_facet(n_idx, color, seed_x, seed_y, visited_cache, img, facet_map, width, height);
+        if new_facet.point_count == 0 {
+            facets[n_idx as usize].alive = false;
+        } else {
+            facets[n_idx as usize] = new_facet;
+            facets[n_idx as usize].alive = true;
         }
     }
 
-    // Recompute border points only in the affected region
-    // Keep existing border points outside the region, recompute inside
-    let old_border: Vec<(i32, i32)> = facets[facet_id as usize].border_points
-        .iter()
-        .filter(|&&(bx, by)| bx < scan_min_x || bx > scan_max_x || by < scan_min_y || by > scan_max_y)
-        .copied()
-        .collect();
-
-    // Scan the affected region for new border points
-    for py in scan_min_y..=scan_max_y {
-        for px in scan_min_x..=scan_max_x {
-            let idx = (py * w + px) as usize;
-            if idx < facet_map.len() && facet_map[idx] == facet_id {
-                if !match_all_around(img, px, py, w, h, color) {
-                    new_border.push((px, py));
+    for &n_idx in &neighbours {
+        if !facets[n_idx as usize].alive { continue; }
+        let bbox = facets[n_idx as usize].bbox.clone();
+        let w = width as i32;
+        for cy in bbox.min_y..=bbox.max_y {
+            for cx in bbox.min_x..=bbox.max_x {
+                let idx = (cy * w + cx) as usize;
+                if idx < facet_map.len() && facet_map[idx] == n_idx {
+                    visited_cache[idx] = false;
                 }
             }
         }
     }
 
-    // Combine old border points outside region with new ones inside region
-    let mut combined_border = old_border;
-    combined_border.extend(new_border);
+    for &idx in &changed_set {
+        if (idx as usize) < facets.len() && facets[idx as usize].alive {
+            facets[idx as usize].neighbour_facets.clear();
+            facets[idx as usize].neighbour_facets_is_dirty = true;
+        }
+    }
+}
 
-    facets[facet_id as usize].point_count = new_count;
-    facets[facet_id as usize].bbox = new_bbox;
-    facets[facet_id as usize].border_points = combined_border;
-    facets[facet_id as usize].neighbour_facets_is_dirty = true;
-
-    if new_count == 0 {
-        facets[facet_id as usize].alive = false;
+fn rebuild_for_facet_change(
+    visited_cache: &mut Vec<bool>,
+    facet_id: u32,
+    facets: &mut Vec<Facet>,
+    img: &mut Vec<u8>,
+    facet_map: &mut Vec<u32>,
+    width: u32, height: u32,
+) {
+    rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, width, height);
+    let bbox = facets[facet_id as usize].bbox.clone();
+    let w = width as i32; let h = height as i32;
+    let mut needs_rebuild = false;
+    for y in bbox.min_y..=bbox.max_y {
+        for x in bbox.min_x..=bbox.max_x {
+            let idx = (y * w + x) as usize;
+            if idx >= facet_map.len() { continue; }
+            if facet_map[idx] != facet_id { continue; }
+            needs_rebuild = true;
+            for (dx, dy) in [(-1i32,0i32),(0,-1),(1,0),(0,1)] {
+                let nx = x+dx; let ny = y+dy;
+                if nx < 0 || ny < 0 || nx >= w || ny >= h { continue; }
+                let nidx = (ny * w + nx) as usize;
+                if nidx >= facet_map.len() { continue; }
+                let nfid = facet_map[nidx] as usize;
+                if nfid == facet_id as usize { continue; }
+                if nfid < facets.len() && facets[nfid].alive {
+                    img[idx] = facets[nfid].color;
+                    break;
+                }
+            }
+        }
+    }
+    if needs_rebuild {
+        rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, width, height);
     }
 }
 
@@ -283,6 +309,7 @@ fn delete_facet(
     img: &mut Vec<u8>,
     facet_map: &mut Vec<u32>,
     color_distances: &[f64], n_colors: u32,
+    visited_cache: &mut Vec<bool>,
     width: u32, height: u32,
 ) {
     if !facets[facet_id as usize].alive { return; }
@@ -295,10 +322,6 @@ fn delete_facet(
     let bbox = facets[facet_id as usize].bbox.clone();
     let w = width as i32;
 
-    // Track which neighbours received pixels and the affected region
-    let mut affected_neighbours: HashSet<u32> = HashSet::new();
-
-    // Step 1: reassign pixels to closest neighbour — identical to original
     for j in bbox.min_y..=bbox.max_y {
         for i in bbox.min_x..=bbox.max_x {
             let idx = (j * w + i) as usize;
@@ -307,43 +330,12 @@ fn delete_facet(
                     &facets[facet_id as usize], facets, i, j, color_distances, n_colors);
                 if closest >= 0 && (closest as usize) < facets.len() && facets[closest as usize].alive {
                     img[idx] = facets[closest as usize].color;
-                    facet_map[idx] = closest as u32;
-                    affected_neighbours.insert(closest as u32);
                 }
             }
         }
     }
 
-    // Step 2: incrementally update metadata for each affected neighbour
-    // O(neighbour_bbox pixels) per neighbour — no flood fill
-    let neighbours: Vec<u32> = facets[facet_id as usize].neighbour_facets.clone();
-    let mut changed_set: HashSet<u32> = HashSet::new();
-
-    for &n_idx in &neighbours {
-        if !facets[n_idx as usize].alive { continue; }
-        changed_set.insert(n_idx);
-        // Also mark neighbours-of-neighbours dirty
-        let nn = facets[n_idx as usize].neighbour_facets.clone();
-        for &nn_idx in &nn { changed_set.insert(nn_idx); }
-    }
-
-    // Update metadata for affected neighbours using region scan
-    for &n_idx in &affected_neighbours {
-        if (n_idx as usize) >= facets.len() || !facets[n_idx as usize].alive { continue; }
-        recompute_facet_metadata_in_region(
-            n_idx, facets, img, facet_map,
-            bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y,
-            width, height,
-        );
-    }
-
-    // Mark all changed neighbours as needing neighbour rebuild
-    for &idx in &changed_set {
-        if (idx as usize) < facets.len() && facets[idx as usize].alive {
-            facets[idx as usize].neighbour_facets_is_dirty = true;
-        }
-    }
-
+    rebuild_for_facet_change(visited_cache, facet_id, facets, img, facet_map, width, height);
     facets[facet_id as usize].alive = false;
 }
 
@@ -378,6 +370,8 @@ fn reduce_facets_internal(
 ) {
     unsafe { CHECKPOINT = 1; }
     let mut facets = get_facets(img, facet_map, width, height);
+    let size = (width * height) as usize;
+    let mut visited_cache = vec![false; size];
     unsafe { CHECKPOINT = 2; }
 
     let mut processing_order: Vec<u32> = facets.iter().filter(|f| f.alive).map(|f| f.id).collect();
@@ -387,7 +381,7 @@ fn reduce_facets_internal(
 
     for &fid in &processing_order {
         if facets[fid as usize].alive && facets[fid as usize].point_count < smaller_than {
-            delete_facet(fid, &mut facets, img, facet_map, color_distances, n_colors, width, height);
+            delete_facet(fid, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, width, height);
         }
     }
     unsafe { CHECKPOINT = 4; }
@@ -396,7 +390,7 @@ fn reduce_facets_internal(
     while facet_count > maximum_facets as usize {
         let min_id = facets.iter().filter(|f| f.alive).min_by_key(|f| f.point_count).map(|f| f.id);
         if let Some(mid) = min_id {
-            delete_facet(mid, &mut facets, img, facet_map, color_distances, n_colors, width, height);
+            delete_facet(mid, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, width, height);
             facet_count -= 1;
         } else { break; }
     }
