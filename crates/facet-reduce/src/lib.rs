@@ -1,84 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// facet_reduce — Rust/WASM implementation of drake7707's FacetReducer
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// HISTORY — DO NOT DELETE — THIS IS THE RECORD OF HUMANITY'S STRUGGLE
-// ─────────────────────────────────────────────────────────────────────
-//
-// The algorithm being implemented is drake7707's paint-by-numbers facet reducer.
-// Source: https://github.com/drake7707/paintbynumbersgenerator
-// TypeScript reference: src/facetReducer.ts (see repository)
-//
-// WHY THIS EXISTS:
-//   The TS FacetReducer ran in ~83 seconds on 1080×1080. The goal was 15 seconds.
-//   The reduce phase = 89-90% of total runtime. Everything else is fast.
-//
-// WHAT HAS BEEN TRIED AND FAILED (each attempt made it worse):
-//
-//   v0.5.17 — Memory pre-grow to 64MB. Necessary but not sufficient.
-//
-//   v0.5.18 — Wrong heap_base offset. OOM during reduce. dlmalloc crash.
-//
-//   v0.5.19 — facet_map.clone() on every neighbour rebuild. At 1800×1800 that
-//             is 32MB+ cloned thousands of times. Catastrophically slow.
-//
-//   v0.5.20 — Zero facet_map clones, visited_cache flood fill rebuild.
-//             THIS IS THE WORKING BASELINE: ~58-72 seconds on 1080×1080.
-//             DO NOT GO BELOW THIS PERFORMANCE.
-//
-//   v0.5.21 (BFS attempt 1) — Allocated vec![u32::MAX; size] INSIDE delete_facet.
-//             At 1800×1800 = 12.96MB allocated per deletion × thousands = GBs.
-//             Result: 858 seconds (14 minutes). Catastrophic regression.
-//
-//   v0.5.21 (BFS attempt 2, "buffer reuse") — Allocated nearest[] once outside
-//             loop. But BFS expands to the ENTIRE IMAGE not just the bbox,
-//             so the touched/reset loop still touched millions of pixels.
-//             Result: still ~14 minutes.
-//
-//   v0.5.22 (incremental metadata) — Replaced flood fill with bbox region scan.
-//             But the "incremental" scan still iterated the full facet bbox for
-//             point_count, which was the same cost as the flood fill.
-//             Result: 187 seconds. Worse than baseline.
-//
-// ROOT CAUSE OF ALL FAILURES:
-//   The bottleneck is in rebuildChangedNeighbourFacets which calls buildFacet
-//   (full flood fill) for each neighbour after each deletion. This is O(N×M)
-//   where N = pixels in neighbour, M = number of deletions.
-//   The flood fill itself is not the only problem — getClosestNeighbourForPixel
-//   scans ALL border points of ALL neighbours for EVERY pixel being reassigned.
-//   For large facets in phase 2 (reducing to maximumNumberOfFacets), this is
-//   thousands of border points × thousands of pixels = millions of ops/deletion.
-//
-// PROFILING DATA (1080×1080 image, 3 reduce runs):
-//   reduce_run1 decile=1 delta_ms=51    ← phase 1 (small facets) is FAST
-//   reduce_run1 decile=9 delta_ms=51926 ← phase 2 (large facets) is THE PROBLEM
-//   reduce_run2 ms=52473
-//   reduce_run3 ms=327                  ← run 3 fast because few facets left
-//   Total: 53 seconds = 90% of runtime
-//
-// CURRENT APPROACH — SPATIAL GRID ACCELERATION:
-//   Instead of scanning all border points linearly per pixel, bucket border
-//   points into a 2D spatial grid. For each pixel query, only check border
-//   points in nearby grid cells. Expected O(1) per pixel lookup.
-//
-//   Academic basis:
-//   - GriSPy: fixed-radius nearest-neighbor via regular grid indexing
-//     https://arxiv.org/pdf/1912.09585
-//   - "Fast image segmentation using region merging with a k-Nearest Neighbor
-//     graph" — IEEE, reduces merging complexity to O(τN log₂N)
-//     https://ieeexplore.ieee.org/document/4670856/
-//   - "Hybrid image segmentation using watersheds and fast region merging" —
-//     maintains Nearest Neighbor Graph to drastically reduce queue size
-//     https://www.researchgate.net/publication/5576266
-//   - Standard 2D spatial hashing: de Berg et al., "Computational Geometry",
-//     Chapter 5 (grid methods for proximity queries)
-//
-//   The pixel assignment logic (getClosestNeighbourForPixel) is UNCHANGED —
-//   same nearest border point semantics, same color distance tiebreak.
-//   Only the lookup is accelerated. Output is bit-for-bit identical to TS.
-//
-// ═══════════════════════════════════════════════════════════════════════════════
-
 use std::collections::HashSet;
 
 static mut CHECKPOINT: u32 = 0;
@@ -94,12 +13,6 @@ struct BoundingBox {
 }
 impl BoundingBox {
     fn new() -> Self { BoundingBox { min_x: i32::MAX, min_y: i32::MAX, max_x: i32::MIN, max_y: i32::MIN } }
-    fn update(&mut self, x: i32, y: i32) {
-        if x < self.min_x { self.min_x = x; }
-        if x > self.max_x { self.max_x = x; }
-        if y < self.min_y { self.min_y = y; }
-        if y > self.max_y { self.max_y = y; }
-    }
 }
 
 struct Facet {
@@ -120,133 +33,6 @@ impl Facet {
                 bbox: BoundingBox::new(), alive: true }
     }
 }
-
-// ── Spatial grid for fast border point nearest-neighbor lookup ────────────────
-//
-// Divides the image into CELL_SIZE×CELL_SIZE cells. Border points are bucketed
-// by cell. For a query pixel at (x,y), we check the cell it falls in plus
-// adjacent cells (search radius). This reduces the scan from O(all border points)
-// to O(border points in nearby cells).
-//
-// Cell size tuning: smaller = faster lookup but more memory overhead.
-// 16px cells is a good tradeoff for typical facet sizes at 1080-1800px images.
-const CELL_SIZE: i32 = 16;
-
-struct SpatialGrid {
-    cells: Vec<Vec<(i32, i32, u32)>>, // (x, y, facet_id)
-    cols: i32,
-    rows: i32,
-}
-
-impl SpatialGrid {
-    fn new(width: u32, height: u32) -> Self {
-        let cols = (width as i32 + CELL_SIZE - 1) / CELL_SIZE;
-        let rows = (height as i32 + CELL_SIZE - 1) / CELL_SIZE;
-        SpatialGrid {
-            cells: vec![Vec::new(); (cols * rows) as usize],
-            cols,
-            rows,
-        }
-    }
-
-    #[inline]
-    fn cell_idx(&self, x: i32, y: i32) -> usize {
-        let cx = (x / CELL_SIZE).min(self.cols - 1);
-        let cy = (y / CELL_SIZE).min(self.rows - 1);
-        (cy * self.cols + cx) as usize
-    }
-
-    fn insert(&mut self, x: i32, y: i32, facet_id: u32) {
-        let idx = self.cell_idx(x, y);
-        self.cells[idx].push((x, y, facet_id));
-    }
-
-    fn remove_facet(&mut self, facet_id: u32, border_points: &[(i32, i32)]) {
-        for &(x, y) in border_points {
-            let idx = self.cell_idx(x, y);
-            self.cells[idx].retain(|&(_, _, fid)| fid != facet_id);
-        }
-    }
-
-    fn add_facet(&mut self, facet_id: u32, border_points: &[(i32, i32)]) {
-        for &(x, y) in border_points {
-            let idx = self.cell_idx(x, y);
-            self.cells[idx].push((x, y, facet_id));
-        }
-    }
-
-    // Find closest border point to (qx, qy) among the given neighbour facets.
-    // Searches expanding rings of cells until we're guaranteed to have found
-    // the nearest point (when cell distance > current best distance).
-    fn find_closest(
-        &self,
-        qx: i32, qy: i32,
-        neighbours: &[u32],
-        facet_color: u8,
-        facets: &[Facet],
-        color_distances: &[f64],
-        n_colors: u32,
-    ) -> i32 {
-        let neighbour_set: HashSet<u32> = neighbours.iter().copied().collect();
-        let qcx = qx / CELL_SIZE;
-        let qcy = qy / CELL_SIZE;
-
-        let mut best_id = -1i32;
-        let mut best_dist_sq = i64::MAX;
-        let mut best_color_dist = f64::MAX;
-
-        // Search expanding rings until cell distance exceeds best distance
-        let max_radius = self.cols.max(self.rows);
-        for radius in 0..max_radius {
-            // Minimum possible squared distance from any point in cells at this radius
-            let min_possible_dist_sq = if radius == 0 {
-                0i64
-            } else {
-                let d = (radius - 1) as i64 * CELL_SIZE as i64;
-                d * d
-            };
-
-            // Early exit: no point in cells further than this can beat current best
-            if min_possible_dist_sq > best_dist_sq { break; }
-
-            // Check all cells in the ring at this radius
-            for dcx in -radius..=radius {
-                for dcy in -radius..=radius {
-                    // Only process the ring border, not interior (already checked)
-                    if radius > 0 && dcx.abs() < radius && dcy.abs() < radius { continue; }
-                    let cx = qcx + dcx;
-                    let cy = qcy + dcy;
-                    if cx < 0 || cy < 0 || cx >= self.cols || cy >= self.rows { continue; }
-                    let cell_idx = (cy * self.cols + cx) as usize;
-                    for &(bx, by, fid) in &self.cells[cell_idx] {
-                        if !neighbour_set.contains(&fid) { continue; }
-                        if (fid as usize) >= facets.len() || !facets[fid as usize].alive { continue; }
-                        let dx = (bx - qx) as i64;
-                        let dy = (by - qy) as i64;
-                        let dist_sq = dx*dx + dy*dy;
-                        if dist_sq < best_dist_sq {
-                            best_dist_sq = dist_sq;
-                            best_id = fid as i32;
-                            best_color_dist = f64::MAX;
-                        } else if dist_sq == best_dist_sq {
-                            let n_color = facets[fid as usize].color;
-                            let cd_idx = (facet_color as u32 * n_colors + n_color as u32) as usize;
-                            if let Some(&cd) = color_distances.get(cd_idx) {
-                                if cd < best_color_dist {
-                                    best_color_dist = cd;
-                                    best_id = fid as i32;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        best_id
-    }
-}
-
-// ── Core algorithm helpers (unchanged from v0.5.20 baseline) ─────────────────
 
 #[inline]
 fn fm_get(facet_map: &[u32], x: i32, y: i32, w: i32, h: i32) -> Option<u32> {
@@ -291,7 +77,10 @@ fn visit_pixel(x: i32, y: i32, w: i32, h: i32,
     if !match_all_around(img, x, y, w, h, facet_color) {
         facet.border_points.push((x, y));
     }
-    facet.bbox.update(x, y);
+    if x < facet.bbox.min_x { facet.bbox.min_x = x; }
+    if x > facet.bbox.max_x { facet.bbox.max_x = x; }
+    if y < facet.bbox.min_y { facet.bbox.min_y = y; }
+    if y > facet.bbox.max_y { facet.bbox.max_y = y; }
 }
 
 fn flood_fill(start_x: i32, start_y: i32, w: i32, h: i32,
@@ -384,17 +173,40 @@ fn ensure_neighbours(facet_id: usize, facets: &mut Vec<Facet>, facet_map: &[u32]
     facets[facet_id].neighbour_facets_is_dirty = false;
 }
 
-// ── rebuild_changed_neighbour_facets — identical to v0.5.20 baseline ─────────
-// This is the flood fill rebuild. It is kept IDENTICAL to the working baseline.
-// The spatial grid accelerates getClosestNeighbourForPixel inside deleteFacet,
-// but the rebuild after is unchanged — modifying it has only made things worse.
+fn get_closest_neighbour_for_pixel(
+    facet: &Facet, facets: &[Facet],
+    x: i32, y: i32, color_distances: &[f64], n_colors: u32) -> i32 {
+    let mut closest = -1i32;
+    let mut min_dist_sq = i64::MAX;
+    let mut min_color_dist = f64::MAX;
+    for &n_idx in &facet.neighbour_facets {
+        let n = &facets[n_idx as usize];
+        if !n.alive { continue; }
+        for &(bx, by) in &n.border_points {
+            let dx = (bx - x) as i64;
+            let dy = (by - y) as i64;
+            let dist_sq = dx*dx + dy*dy;
+            if dist_sq < min_dist_sq {
+                min_dist_sq = dist_sq;
+                closest = n_idx as i32;
+                min_color_dist = f64::MAX;
+            } else if dist_sq == min_dist_sq {
+                let cd_idx = (facet.color as u32 * n_colors + n.color as u32) as usize;
+                if let Some(&cd) = color_distances.get(cd_idx) {
+                    if cd < min_color_dist { min_color_dist = cd; closest = n_idx as i32; }
+                }
+            }
+        }
+    }
+    closest
+}
+
 fn rebuild_changed_neighbour_facets(
     visited_cache: &mut Vec<bool>,
     facet_id: u32,
     facets: &mut Vec<Facet>,
     img: &mut Vec<u8>,
     facet_map: &mut Vec<u32>,
-    grid: &mut SpatialGrid,
     width: u32, height: u32,
 ) {
     ensure_neighbours(facet_id as usize, facets, facet_map, width, height);
@@ -423,16 +235,10 @@ fn rebuild_changed_neighbour_facets(
         let (seed_x, seed_y) = facets[n_idx as usize].border_points[0];
         let color = facets[n_idx as usize].color;
 
-        // Remove old border points from spatial grid before rebuild
-        let old_bps = facets[n_idx as usize].border_points.clone();
-        grid.remove_facet(n_idx, &old_bps);
-
         let new_facet = build_facet(n_idx, color, seed_x, seed_y, visited_cache, img, facet_map, width, height);
         if new_facet.point_count == 0 {
             facets[n_idx as usize].alive = false;
         } else {
-            // Add new border points to spatial grid
-            grid.add_facet(n_idx, &new_facet.border_points);
             facets[n_idx as usize] = new_facet;
             facets[n_idx as usize].alive = true;
         }
@@ -466,10 +272,9 @@ fn rebuild_for_facet_change(
     facets: &mut Vec<Facet>,
     img: &mut Vec<u8>,
     facet_map: &mut Vec<u32>,
-    grid: &mut SpatialGrid,
     width: u32, height: u32,
 ) {
-    rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, grid, width, height);
+    rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, width, height);
     let bbox = facets[facet_id as usize].bbox.clone();
     let w = width as i32; let h = height as i32;
     let mut needs_rebuild = false;
@@ -494,7 +299,7 @@ fn rebuild_for_facet_change(
         }
     }
     if needs_rebuild {
-        rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, grid, width, height);
+        rebuild_changed_neighbour_facets(visited_cache, facet_id, facets, img, facet_map, width, height);
     }
 }
 
@@ -505,7 +310,6 @@ fn delete_facet(
     facet_map: &mut Vec<u32>,
     color_distances: &[f64], n_colors: u32,
     visited_cache: &mut Vec<bool>,
-    grid: &mut SpatialGrid,
     width: u32, height: u32,
 ) {
     if !facets[facet_id as usize].alive { return; }
@@ -517,19 +321,13 @@ fn delete_facet(
 
     let bbox = facets[facet_id as usize].bbox.clone();
     let w = width as i32;
-    let facet_color = facets[facet_id as usize].color;
-    let neighbours = facets[facet_id as usize].neighbour_facets.clone();
 
-    // ── Pixel reassignment using spatial grid lookup ──────────────────────────
-    // This replaces the O(pixels × all_border_points) linear scan with an
-    // O(pixels × nearby_cells) spatial grid lookup.
-    // Pixel assignment semantics are IDENTICAL to TS getClosestNeighbourForPixel:
-    // nearest border point wins, color distance breaks ties.
     for j in bbox.min_y..=bbox.max_y {
         for i in bbox.min_x..=bbox.max_x {
             let idx = (j * w + i) as usize;
             if idx < facet_map.len() && facet_map[idx] == facet_id {
-                let closest = grid.find_closest(i, j, &neighbours, facet_color, facets, color_distances, n_colors);
+                let closest = get_closest_neighbour_for_pixel(
+                    &facets[facet_id as usize], facets, i, j, color_distances, n_colors);
                 if closest >= 0 && (closest as usize) < facets.len() && facets[closest as usize].alive {
                     img[idx] = facets[closest as usize].color;
                 }
@@ -537,20 +335,14 @@ fn delete_facet(
         }
     }
 
-    // Remove deleted facet's border points from spatial grid
-    let old_bps = facets[facet_id as usize].border_points.clone();
-    grid.remove_facet(facet_id, &old_bps);
-
-    rebuild_for_facet_change(visited_cache, facet_id, facets, img, facet_map, grid, width, height);
+    rebuild_for_facet_change(visited_cache, facet_id, facets, img, facet_map, width, height);
     facets[facet_id as usize].alive = false;
 }
 
-fn get_facets(img: &mut Vec<u8>, facet_map: &mut Vec<u32>, width: u32, height: u32) -> (Vec<Facet>, SpatialGrid) {
+fn get_facets(img: &mut Vec<u8>, facet_map: &mut Vec<u32>, width: u32, height: u32) -> Vec<Facet> {
     let size = (width * height) as usize;
     let mut visited = vec![false; size];
     let mut facets: Vec<Facet> = Vec::new();
-    let mut grid = SpatialGrid::new(width, height);
-
     for j in 0..height as i32 {
         for i in 0..width as i32 {
             let idx = (j * width as i32 + i) as usize;
@@ -562,18 +354,13 @@ fn get_facets(img: &mut Vec<u8>, facet_map: &mut Vec<u32>, width: u32, height: u
             }
         }
     }
-
-    // Build neighbours and spatial grid in one pass
     for i in 0..facets.len() {
         let bps = facets[i].border_points.clone();
         let fid = facets[i].id;
         facets[i].neighbour_facets = build_neighbours_from_border_points(&bps, fid, facet_map, width, height);
         facets[i].neighbour_facets_is_dirty = false;
-        // Insert all border points into spatial grid
-        grid.add_facet(fid, &bps);
     }
-
-    (facets, grid)
+    facets
 }
 
 fn reduce_facets_internal(
@@ -582,7 +369,7 @@ fn reduce_facets_internal(
     remove_large_to_small: bool, color_distances: &[f64], n_colors: u32,
 ) {
     unsafe { CHECKPOINT = 1; }
-    let (mut facets, mut grid) = get_facets(img, facet_map, width, height);
+    let mut facets = get_facets(img, facet_map, width, height);
     let size = (width * height) as usize;
     let mut visited_cache = vec![false; size];
     unsafe { CHECKPOINT = 2; }
@@ -594,7 +381,7 @@ fn reduce_facets_internal(
 
     for &fid in &processing_order {
         if facets[fid as usize].alive && facets[fid as usize].point_count < smaller_than {
-            delete_facet(fid, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, &mut grid, width, height);
+            delete_facet(fid, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, width, height);
         }
     }
     unsafe { CHECKPOINT = 4; }
@@ -603,7 +390,7 @@ fn reduce_facets_internal(
     while facet_count > maximum_facets as usize {
         let min_id = facets.iter().filter(|f| f.alive).min_by_key(|f| f.point_count).map(|f| f.id);
         if let Some(mid) = min_id {
-            delete_facet(mid, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, &mut grid, width, height);
+            delete_facet(mid, &mut facets, img, facet_map, color_distances, n_colors, &mut visited_cache, width, height);
             facet_count -= 1;
         } else { break; }
     }
